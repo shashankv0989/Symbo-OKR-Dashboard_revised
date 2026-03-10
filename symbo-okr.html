@@ -1,0 +1,1232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Symbo OKR Intelligence</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #f0f4f7; font-family: 'Inter Tight', system-ui, sans-serif; }
+    @import url('https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;600;700;800;900&display=swap');
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-thumb { background: #c8d8e4; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+  // ─── CONFIG — EDIT THESE TWO LINES ──────────────────────────────────────────
+  // 1. Replace with your Google Sheet ID (the long string in the sheet URL)
+  const SHEET_ID = "YOUR_GOOGLE_SHEET_ID_HERE";
+  // 2. Auto-refresh interval in minutes. Set to 0 to disable.
+  const AUTO_REFRESH_MINUTES = 5;
+  // ─────────────────────────────────────────────────────────────────────────────
+  // REQUIRED SHEET STRUCTURE:
+  // Sheet "Config"   → columns: key | value
+  //   rows: month_label, days_elapsed, days_in_month, mtd_gwp, mtd_nop
+  // Sheet "Daily"    → columns: day | gwp | nop
+  // Sheet "Monthly"  → columns: label | gwp | nop   (previous complete months only)
+  // Sheet "Products" → columns: product | client | vertical | pod | psm |
+  //                              status | insurer | mtd_gwp | mtd_nop |
+  //                              dec_gwp | jan_gwp | feb_gwp | dec_nop | jan_nop | feb_nop
+  // ─────────────────────────────────────────────────────────────────────────────
+
+  const GVIZ_BASE = `https://docs.google.com/spreadsheets/d/${SHEET_ID}/gviz/tq?tqx=out:json`;
+
+  const { useState, useEffect, useMemo, createContext, useContext } = React;
+  const {
+    AreaChart, Area, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer,
+    PieChart, Pie, Cell, Legend, CartesianGrid, LineChart, Line, ReferenceLine,
+    ComposedChart
+  } = Recharts;
+
+  // ─── DATA CONTEXT ────────────────────────────────────────────────────────────
+  const DataCtx = createContext(null);
+  const useData = () => useContext(DataCtx);
+
+  // ─── DESIGN TOKENS ───────────────────────────────────────────────────────────
+  const C = {
+    blue:"#013a51",green:"#00c98f",yellow:"#fbd22b",bg:"#f0f4f7",white:"#ffffff",
+    card:"#ffffff",border:"#e2eaf0",muted:"#6b8fa8",dim:"#4a6a80",text:"#0d1f2d",
+    lightBlue:"#e8f2f8",lightGreen:"#e6faf4",lightYellow:"#fdf8e7",
+    red:"#e53e3e",orange:"#f6851a",proj:"#a78bfa",projLight:"#ede9fe",
+  };
+  const PALETTE=["#013a51","#00c98f","#fbd22b","#f6851a","#6c63ff","#e53e3e","#00bcd4","#a3e635","#f472b6","#fb923c"];
+  const FONT="'Inter Tight', system-ui, sans-serif";
+
+  // ─── HELPERS ─────────────────────────────────────────────────────────────────
+  const cr  = v => { if(v>=1e7) return `₹${(v/1e7).toFixed(1)}Cr`; if(v>=1e5) return `₹${(v/1e5).toFixed(1)}L`; return `₹${v.toLocaleString('en-IN')}`; };
+  const fmtN= v => { if(v>=1e6) return `${(v/1e6).toFixed(2)}M`; if(v>=1e3) return `${(v/1e3).toFixed(1)}K`; return String(v); };
+  const pct = v => `${v>0?'+':''}${v.toFixed(1)}%`;
+  const pctColor = v => v >= 0 ? C.green : C.red;
+
+  const normalizeInsurer = ins => {
+    if(!ins) return 'Other';
+    const n=ins.toLowerCase();
+    if(n.includes('reliance')) return 'Reliance General';
+    if(n.includes('acko'))     return 'Acko General';
+    if(n.includes('rimedo'))   return 'RIMEDO Pvt Ltd';
+    if(n.includes('icici'))    return 'ICICI Lombard';
+    if(n.includes('cover'))    return 'Cover Nomads';
+    if(n.includes('iffco'))    return 'IFFCO Tokio';
+    if(n.includes('tata aia')) return 'Tata AIA';
+    if(n.includes('tata aig')) return 'Tata AIG';
+    if(n.includes('care'))     return 'Care Health';
+    if(n.includes('digit'))    return 'Digit';
+    if(n.includes('zuno'))     return 'Zuno General';
+    if(n.includes('universal'))return 'Universal Sompo';
+    if(n.includes('kotak'))    return 'Kotak';
+    if(n.includes('rak'))      return 'RAK';
+    return ins;
+  };
+
+  // ─── GOOGLE SHEETS FETCHER ───────────────────────────────────────────────────
+  const fetchSheet = async (sheetName) => {
+    const url = `${GVIZ_BASE}&sheet=${encodeURIComponent(sheetName)}&t=${Date.now()}`;
+    const text = await fetch(url).then(r => r.text());
+    // Strip GVIZ wrapper: /*O_o*/\ngoogle.visualization.Query.setResponse({...});
+    const jsonStr = text.replace(/^[^{]*/, '').replace(/\);\s*$/, '');
+    const data = JSON.parse(jsonStr);
+    if (data.status === 'error') {
+      const msg = data.errors?.[0]?.detailed_message || data.errors?.[0]?.message || 'Sheet error';
+      throw new Error(`Sheet "${sheetName}": ${msg}`);
+    }
+    if (!data.table) throw new Error(`Sheet "${sheetName}": no table data returned`);
+    const cols = data.table.cols.map(c => (c.label || c.id || '').trim().toLowerCase());
+    return (data.table.rows || []).map(row => {
+      const obj = {};
+      row.c.forEach((cell, i) => { obj[cols[i]] = cell ? cell.v : null; });
+      return obj;
+    });
+  };
+
+  // ─── SHARED UI COMPONENTS ────────────────────────────────────────────────────
+  const ProjBadge = () => (
+    <span style={{fontSize:9,fontWeight:800,color:C.proj,background:C.projLight,padding:'2px 7px',borderRadius:20,border:`1px solid ${C.proj}40`,letterSpacing:'0.3px'}}>
+      DRR PROJ
+    </span>
+  );
+  const MTDBadge = () => (
+    <span style={{fontSize:9,fontWeight:800,color:C.muted,background:`${C.muted}15`,padding:'2px 7px',borderRadius:20,border:`1px solid ${C.muted}30`,letterSpacing:'0.3px'}}>
+      MTD ACTUAL
+    </span>
+  );
+
+  const DrrInfoBar = () => {
+    const { DRR_VAL, MTD_GWP, PROJ_GWP, PROJ_MOM, RAW_MOM, DAYS_ELAPSED, DAYS_IN_MONTH } = useData();
+    return (
+      <div style={{background:`${C.proj}12`,border:`1px solid ${C.proj}30`,borderRadius:10,padding:'10px 16px',display:'flex',gap:24,alignItems:'center',flexWrap:'wrap'}}>
+        <div style={{display:'flex',alignItems:'center',gap:8}}>
+          <div style={{width:10,height:10,borderRadius:2,background:C.proj}}/>
+          <span style={{fontSize:12,fontWeight:700,color:C.blue}}>DRR Projection Active</span>
+          <span style={{fontSize:11,color:C.muted}}>MTD ({DAYS_ELAPSED} days) extrapolated to full {DAYS_IN_MONTH}-day month at current run rate</span>
+        </div>
+        {[
+          {l:'Days Elapsed', v:`${DAYS_ELAPSED} of ${DAYS_IN_MONTH}`},
+          {l:'Daily Run Rate', v:cr(DRR_VAL)+'/day'},
+          {l:'Mar MTD (actual)', v:cr(MTD_GWP)},
+          {l:'Mar Projected', v:cr(PROJ_GWP)},
+          {l:'Raw MoM', v:pct(RAW_MOM), c:pctColor(RAW_MOM)},
+          {l:'Projected MoM', v:pct(PROJ_MOM), c:pctColor(PROJ_MOM)},
+        ].map(({l,v,c})=>(
+          <div key={l} style={{textAlign:'center'}}>
+            <div style={{fontSize:9,color:C.muted,fontWeight:600}}>{l}</div>
+            <div style={{fontSize:13,fontWeight:900,color:c||C.blue}}>{v}</div>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  const KpiCard=({label,value,sub,color=C.blue,delta,icon,badge})=>(
+    <div style={{background:C.white,borderRadius:12,padding:'16px 18px',border:`1px solid ${C.border}`,borderTop:`3px solid ${color}`,display:'flex',flexDirection:'column',gap:4,flex:1}}>
+      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+        <span style={{fontSize:10,fontWeight:700,color:C.muted,textTransform:'uppercase',letterSpacing:'0.6px'}}>{label}</span>
+        {icon&&<span style={{fontSize:16}}>{icon}</span>}
+      </div>
+      {badge&&<div style={{marginBottom:2}}>{badge}</div>}
+      <div style={{fontSize:24,fontWeight:900,color,lineHeight:1,fontFamily:FONT}}>{value}</div>
+      {sub&&<div style={{fontSize:11,color:C.muted}}>{sub}</div>}
+      {delta!==undefined&&(
+        <div style={{fontSize:12,fontWeight:700,color:delta>=0?C.green:C.red,marginTop:2}}>
+          {delta>=0?'▲':'▼'} {Math.abs(delta).toFixed(1)}% vs prev month
+        </div>
+      )}
+    </div>
+  );
+
+  const SectionTitle=({children,sub})=>(
+    <div style={{marginBottom:14}}>
+      <div style={{display:'flex',alignItems:'center',gap:8}}>
+        <div style={{width:3,height:18,background:C.green,borderRadius:2}}/>
+        <h2 style={{margin:0,fontSize:15,fontWeight:800,color:C.blue}}>{children}</h2>
+      </div>
+      {sub&&<p style={{margin:'3px 0 0 11px',fontSize:11,color:C.muted}}>{sub}</p>}
+    </div>
+  );
+
+  const ChipBadge=({label,color=C.green})=>(
+    <span style={{fontSize:10,fontWeight:700,color,background:`${color}18`,padding:'2px 7px',borderRadius:20,border:`1px solid ${color}30`}}>{label}</span>
+  );
+
+  const CustomTip=({active,payload,label})=>{
+    if(!active||!payload?.length) return null;
+    return(
+      <div style={{background:C.white,border:`1px solid ${C.border}`,borderRadius:8,padding:'10px 14px',boxShadow:'0 4px 16px rgba(0,0,0,0.08)',fontFamily:FONT}}>
+        <p style={{margin:0,fontSize:11,color:C.muted,fontWeight:600}}>{label}</p>
+        {payload.map((p,i)=>(
+          <p key={i} style={{margin:'4px 0 0',fontSize:12,fontWeight:700,color:p.color||C.blue}}>
+            {p.name}: {typeof p.value==='number'&&p.value<200?`₹${p.value}Cr`:fmtN(p.value)}
+          </p>
+        ))}
+      </div>
+    );
+  };
+
+  // ─── TAB 1: EXECUTIVE VIEW ───────────────────────────────────────────────────
+  const ExecutiveTab = () => {
+    const { PRODUCT_DATA, RAW_MONTHLY, MTD_GWP, MTD_NOP, PROJ_GWP, PROJ_NOP, DAILY_TOTALS, VERTICALS, DRR_VAL, PROJ_MOM, RAW_MOM, MONTH_LABEL } = useData();
+    const top10 = PRODUCT_DATA.filter(p=>p.proj_gwp>0).sort((a,b)=>b.proj_gwp-a.proj_gwp).slice(0,10);
+
+    const monthlyChart = [
+      ...RAW_MONTHLY.map(m=>({label:m.label,'GWP (₹Cr)':+(m.gwp/1e7).toFixed(1)})),
+      {label:MONTH_LABEL,isPartial:true,'MTD Actual (₹Cr)':+(MTD_GWP/1e7).toFixed(1),'Projected (₹Cr)':+(PROJ_GWP/1e7).toFixed(1)},
+    ];
+    const vertBar = VERTICALS.map(v=>({
+      name:v.key,
+      'Projected (₹Cr)':+(v.proj_gwp/1e7).toFixed(2),
+      'Feb GWP (₹Cr)':+(v.gwp[2]/1e7).toFixed(2),
+    }));
+    const dailyChart = DAILY_TOTALS.map(d=>({day:`Mar ${d.day}`,'GWP (₹Cr)':+(d.gwp/1e7).toFixed(2)}));
+
+    return(
+      <div style={{display:'flex',flexDirection:'column',gap:14}}>
+        <DrrInfoBar/>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(6,1fr)',gap:10}}>
+          <KpiCard label="Mar Projected GWP" value={cr(PROJ_GWP)} sub={`DRR × ${useData().DAYS_IN_MONTH} days`} color={C.proj} icon="🔮" badge={<ProjBadge/>} delta={PROJ_MOM}/>
+          <KpiCard label="Mar MTD GWP" value={cr(MTD_GWP)} sub={`${useData().DAYS_ELAPSED} days actual`} color={C.blue} icon="💰" badge={<MTDBadge/>}/>
+          <KpiCard label="Daily Run Rate" value={cr(DRR_VAL)} sub="Per day (MTD avg)" color={C.yellow} icon="📈"/>
+          <KpiCard label="Projected MoM" value={pct(PROJ_MOM)} sub="Proj vs prev month" color={pctColor(PROJ_MOM)} icon={PROJ_MOM>=0?"📈":"📉"}/>
+          <KpiCard label="Raw MoM (misleading)" value={pct(RAW_MOM)} sub="MTD vs prev — partial!" color={C.muted} icon="⚠️"/>
+          <KpiCard label="Active Programs" value={PRODUCT_DATA.filter(p=>p.status==='Live'&&p.mtd_gwp>0).length} sub="Live products" color={C.blue} icon="✅"/>
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'2fr 1fr',gap:12}}>
+          <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+            <SectionTitle sub="Last 3 full months + current projected vs actual MTD">Monthly GWP Trend (DRR Projected)</SectionTitle>
+            <ResponsiveContainer width="100%" height={200}>
+              <BarChart data={monthlyChart} margin={{left:-10,right:10}}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#eef3f7" vertical={false}/>
+                <XAxis dataKey="label" tick={{fontSize:11,fill:C.muted}} axisLine={false} tickLine={false}/>
+                <YAxis tick={{fontSize:10,fill:C.muted}} axisLine={false} tickLine={false} tickFormatter={v=>`₹${v}Cr`}/>
+                <Tooltip content={<CustomTip/>}/>
+                <Legend wrapperStyle={{fontSize:10}}/>
+                <Bar dataKey="GWP (₹Cr)" fill={C.blue} radius={[5,5,0,0]}/>
+                <Bar dataKey="Projected (₹Cr)" fill={C.proj} radius={[5,5,0,0]}/>
+                <Bar dataKey="MTD Actual (₹Cr)" fill={`${C.blue}50`} radius={[5,5,0,0]}/>
+              </BarChart>
+            </ResponsiveContainer>
+            <div style={{display:'flex',gap:8,marginTop:10}}>
+              {[
+                ...RAW_MONTHLY.map(m=>({l:m.label,v:cr(m.gwp),c:C.blue})),
+                {l:'Mar Proj',v:cr(PROJ_GWP),c:C.proj,badge:true},
+                {l:'Mar MTD',v:cr(MTD_GWP),c:C.muted},
+              ].map(({l,v,c,badge})=>(
+                <div key={l} style={{flex:1,background:badge?C.projLight:C.bg,borderRadius:8,padding:'6px 8px',textAlign:'center',border:badge?`1px solid ${C.proj}30`:'none'}}>
+                  <div style={{fontSize:9,color:C.muted}}>{l}</div>
+                  <div style={{fontSize:12,fontWeight:800,color:c}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+            <SectionTitle sub="Projected GWP share by vertical">Vertical Split (Projected)</SectionTitle>
+            <ResponsiveContainer width="100%" height={150}>
+              <PieChart>
+                <Pie data={VERTICALS.filter(v=>v.proj_gwp>0)} dataKey="proj_gwp" nameKey="key" cx="50%" cy="50%" outerRadius={60} innerRadius={30}>
+                  {VERTICALS.filter(v=>v.proj_gwp>0).map((_,i)=><Cell key={i} fill={PALETTE[i%PALETTE.length]}/>)}
+                </Pie>
+                <Tooltip formatter={v=>cr(v)}/>
+              </PieChart>
+            </ResponsiveContainer>
+            <div style={{marginTop:4}}>
+              {VERTICALS.filter(v=>v.proj_gwp>0).map((v,i)=>(
+                <div key={v.key} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'3px 0',borderBottom:`1px solid ${C.border}`}}>
+                  <div style={{display:'flex',alignItems:'center',gap:6}}>
+                    <div style={{width:7,height:7,borderRadius:2,background:PALETTE[i%PALETTE.length]}}/>
+                    <span style={{fontSize:11,color:C.dim}}>{v.key}</span>
+                  </div>
+                  <div style={{textAlign:'right'}}>
+                    <span style={{fontSize:11,fontWeight:800,color:PALETTE[i%PALETTE.length]}}>{cr(v.proj_gwp)}</span>
+                    <span style={{fontSize:9,color:C.muted,marginLeft:4}}>proj</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+          <SectionTitle sub="Projected Mar vs Feb — fair apples-to-apples MoM by vertical">Vertical MoM (Projected Mar vs Feb)</SectionTitle>
+          <ResponsiveContainer width="100%" height={180}>
+            <BarChart data={vertBar} margin={{left:-10,right:10}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eef3f7" vertical={false}/>
+              <XAxis dataKey="name" tick={{fontSize:11,fill:C.dim}} axisLine={false} tickLine={false}/>
+              <YAxis tick={{fontSize:10,fill:C.muted}} axisLine={false} tickLine={false} tickFormatter={v=>`₹${v}Cr`}/>
+              <Tooltip content={<CustomTip/>}/>
+              <Legend wrapperStyle={{fontSize:10}}/>
+              <Bar dataKey="Feb GWP (₹Cr)" fill={`${C.blue}50`} radius={[4,4,0,0]}/>
+              <Bar dataKey="Projected (₹Cr)" fill={C.proj} radius={[4,4,0,0]}/>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+          <SectionTitle sub={`Daily GWP (${DAILY_TOTALS.length} days) with DRR reference line`}>Daily GWP Trend vs DRR</SectionTitle>
+          <ResponsiveContainer width="100%" height={170}>
+            <ComposedChart data={dailyChart} margin={{left:-10,right:10}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eef3f7" vertical={false}/>
+              <XAxis dataKey="day" tick={{fontSize:10,fill:C.muted}} axisLine={false} tickLine={false}/>
+              <YAxis tick={{fontSize:10,fill:C.muted}} axisLine={false} tickLine={false} tickFormatter={v=>`₹${v}Cr`}/>
+              <Tooltip content={<CustomTip/>}/>
+              <ReferenceLine y={+(DRR_VAL/1e7).toFixed(2)} stroke={C.proj} strokeDasharray="5 4" strokeWidth={2}
+                label={{value:`DRR ₹${(DRR_VAL/1e7).toFixed(1)}Cr`,position:'right',fontSize:9,fill:C.proj}}/>
+              <Area type="monotone" dataKey="GWP (₹Cr)" stroke={C.blue} fill={`${C.blue}15`} strokeWidth={2.5} dot={{fill:C.blue,r:4}}/>
+            </ComposedChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+          <SectionTitle sub="Ranked by projected full-month GWP — not raw MTD">Top 10 Contributors (DRR Projected)</SectionTitle>
+          <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:10}}>
+            {top10.map((p,i)=>{
+              const share=(p.proj_gwp/PROJ_GWP*100).toFixed(1);
+              return(
+                <div key={p.product} style={{background:C.bg,borderRadius:10,padding:'12px 14px',borderLeft:`3px solid ${PALETTE[i%PALETTE.length]}`}}>
+                  <div style={{fontSize:9,color:C.muted,marginBottom:3}}>#{i+1} · {p.vertical}</div>
+                  <div style={{fontSize:12,fontWeight:800,color:C.blue}}>{p.client}</div>
+                  <div style={{fontSize:10,color:C.muted,marginBottom:8}}>{p.product}</div>
+                  <div style={{fontSize:18,fontWeight:900,color:PALETTE[i%PALETTE.length]}}>{cr(p.proj_gwp)}</div>
+                  <div style={{fontSize:10,color:C.proj,marginTop:2}}>Projected · {cr(p.mtd_gwp)} MTD</div>
+                  <div style={{height:3,background:`${PALETTE[i%PALETTE.length]}20`,borderRadius:2,marginTop:8}}>
+                    <div style={{height:'100%',width:`${Math.min(parseFloat(share)*2,100)}%`,background:PALETTE[i%PALETTE.length],borderRadius:2}}/>
+                  </div>
+                  <div style={{fontSize:10,color:C.muted,marginTop:3}}>{share}% of proj total</div>
+                  <div style={{fontSize:10,fontWeight:700,color:pctColor(p.proj_mom),marginTop:2}}>{pct(p.proj_mom)} MoM (proj)</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ─── TAB 2: DAILY WAR ROOM ───────────────────────────────────────────────────
+  const WarRoomTab = () => {
+    const { DAILY_TOTALS, DRR_VAL, MTD_GWP, PROJ_GWP, PROJ_MOM, PRODUCT_DATA } = useData();
+    const today = DAILY_TOTALS[DAILY_TOTALS.length - 1];
+    const yesterday = DAILY_TOTALS[DAILY_TOTALS.length - 2] || today;
+    const todayVsYday = ((today.gwp - yesterday.gwp) / (yesterday.gwp || 1) * 100);
+
+    const declining = PRODUCT_DATA.filter(p => {
+      if(p.status !== 'Live') return false;
+      const [d1,d2,d3] = p.last3_proj;
+      return d1>0 && d2>0 && d3>0 && d3<d2 && d2<d1;
+    });
+    const movers = [...PRODUCT_DATA].filter(p=>p.mtd_gwp>0)
+      .sort((a,b)=>Math.abs(b.proj_mom)-Math.abs(a.proj_mom)).slice(0,8);
+
+    return(
+      <div style={{display:'flex',flexDirection:'column',gap:14}}>
+        <DrrInfoBar/>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:10}}>
+          <KpiCard label="Latest Day GWP" value={cr(today.gwp)} sub={`Mar ${today.day} · prev: ${cr(yesterday.gwp)}`} color={C.blue} icon="📅" delta={todayVsYday}/>
+          <KpiCard label="Daily Run Rate" value={cr(DRR_VAL)} sub="MTD average" color={C.yellow} icon="📊"/>
+          <KpiCard label="Mar Projected" value={cr(PROJ_GWP)} sub="At current DRR pace" color={C.proj} icon="🔮" badge={<ProjBadge/>}/>
+          <KpiCard label="Projected MoM" value={pct(PROJ_MOM)} sub="Proj Mar vs Feb" color={pctColor(PROJ_MOM)} icon={PROJ_MOM>=0?"📈":"📉"}/>
+          <KpiCard label="Decline Alerts" value={declining.length} sub="3-mo drop (incl proj)" color={C.red} icon="⚠️"/>
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+          <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+            <SectionTitle sub="Daily GWP vs DRR baseline — purple dashed = daily run rate">Daily Pace vs DRR</SectionTitle>
+            <ResponsiveContainer width="100%" height={200}>
+              <ComposedChart data={DAILY_TOTALS.map((d,i)=>{
+                const win=DAILY_TOTALS.slice(Math.max(0,i-6),i+1);
+                return {day:`Mar ${d.day}`,'Daily GWP':+(d.gwp/1e7).toFixed(2),'7d Avg':+(win.reduce((s,x)=>s+x.gwp,0)/win.length/1e7).toFixed(2)};
+              })} margin={{left:-10,right:10}}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#eef3f7" vertical={false}/>
+                <XAxis dataKey="day" tick={{fontSize:10,fill:C.muted}} axisLine={false} tickLine={false}/>
+                <YAxis tick={{fontSize:10,fill:C.muted}} axisLine={false} tickLine={false} tickFormatter={v=>`₹${v}Cr`}/>
+                <Tooltip content={<CustomTip/>}/>
+                <ReferenceLine y={+(DRR_VAL/1e7).toFixed(2)} stroke={C.proj} strokeDasharray="5 4" strokeWidth={2}
+                  label={{value:'DRR',position:'right',fontSize:9,fill:C.proj}}/>
+                <Bar dataKey="Daily GWP" fill={`${C.blue}35`} radius={[3,3,0,0]}/>
+                <Line type="monotone" dataKey="7d Avg" stroke={C.yellow} strokeWidth={2.5} dot={false}/>
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+            <SectionTitle sub="Ranked by projected MoM — not raw MTD drop">Top Movers (Projected MoM)</SectionTitle>
+            <div style={{display:'flex',flexDirection:'column',gap:5,overflowY:'auto',maxHeight:220}}>
+              {movers.map(p=>(
+                <div key={p.product} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 12px',borderRadius:8,background:p.proj_mom>0?C.lightGreen:'#fff5f5'}}>
+                  <div>
+                    <div style={{fontSize:12,fontWeight:700,color:C.blue}}>{p.client}</div>
+                    <div style={{fontSize:10,color:C.muted}}>{p.product} · {p.vertical}</div>
+                  </div>
+                  <div style={{textAlign:'right'}}>
+                    <div style={{fontSize:13,fontWeight:900,color:pctColor(p.proj_mom)}}>{pct(p.proj_mom)}</div>
+                    <div style={{fontSize:10,color:C.proj}}>{cr(p.proj_gwp)} proj</div>
+                    <div style={{fontSize:9,color:C.muted}}>{cr(p.mtd_gwp)} MTD</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`,borderLeft:`4px solid ${C.red}`}}>
+          <SectionTitle sub="Uses DRR-projected March — removes false negatives from partial month comparison">
+            ⚠️ Decline Alerts — Projected 3-Month Trend (Jan → Feb → Proj Mar)
+          </SectionTitle>
+          {declining.length===0?(
+            <div style={{color:C.muted,fontSize:13,padding:16,textAlign:'center'}}>✅ No products showing projected 3-month decline.</div>
+          ):(
+            <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:10}}>
+              {declining.slice(0,10).map((p,i)=>{
+                const [d1,d2,d3]=p.last3_proj;
+                const drop=d1>0?((d3-d1)/d1*100).toFixed(0):0;
+                return(
+                  <div key={p.product} style={{background:'#fff5f5',borderRadius:10,padding:'12px 14px',border:`1px solid ${C.red}20`}}>
+                    <div style={{fontSize:12,fontWeight:800,color:C.blue}}>{p.client}</div>
+                    <div style={{fontSize:10,color:C.muted,marginBottom:8}}>{p.product}</div>
+                    <div style={{display:'flex',gap:4,alignItems:'flex-end',marginBottom:8,height:40}}>
+                      {[d1,d2,d3].map((v,j)=>{
+                        const mx=Math.max(d1,d2,d3);
+                        const h=mx>0?Math.max(5,(v/mx)*36):5;
+                        return(
+                          <div key={j} style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',gap:2,justifyContent:'flex-end'}}>
+                            <div style={{height:h,width:'100%',background:j===2?C.proj:j===1?`${C.red}70`:`${C.red}40`,borderRadius:3,
+                              backgroundImage:j===2?`repeating-linear-gradient(45deg,transparent,transparent 3px,rgba(255,255,255,0.3) 3px,rgba(255,255,255,0.3) 6px)`:undefined}}/>
+                            <div style={{fontSize:7,color:j===2?C.proj:C.muted}}>{j===2?'Proj':['Jan','Feb'][j]}</div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <div style={{fontSize:12,fontWeight:900,color:C.red}}>{drop}% drop</div>
+                    <div style={{fontSize:9,color:C.muted}}>Jan → Proj Mar</div>
+                    <div style={{fontSize:10,fontWeight:700,color:C.proj,marginTop:3}}>Proj: {cr(p.proj_gwp)}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // ─── TAB 3: PRODUCT DRILL ────────────────────────────────────────────────────
+  const ProductTab = () => {
+    const { PRODUCT_DATA, CLIENTS } = useData();
+    const [selectedClient, setSelectedClient] = useState(null);
+    const clientList = CLIENTS.slice(0,15);
+    const clientProds = selectedClient ? PRODUCT_DATA.filter(p=>p.client===selectedClient).sort((a,b)=>b.proj_gwp-a.proj_gwp) : null;
+    const MONTHS_LABELS = ["Dec'25","Jan'26","Feb'26","Mar Proj"];
+
+    return(
+      <div style={{display:'flex',flexDirection:'column',gap:14}}>
+        <DrrInfoBar/>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1.5fr',gap:12}}>
+          <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+            <SectionTitle sub="Sorted by projected full-month GWP — click to drill">Client Leaderboard (Projected)</SectionTitle>
+            <div style={{display:'flex',flexDirection:'column',gap:3}}>
+              {clientList.map((c,i)=>{
+                const proj_mom=c.gwp[2]>0?(c.proj_gwp-c.gwp[2])/c.gwp[2]*100:0;
+                return(
+                  <div key={c.key} onClick={()=>setSelectedClient(c.key===selectedClient?null:c.key)}
+                    style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'9px 12px',borderRadius:8,cursor:'pointer',
+                      background:selectedClient===c.key?`${C.blue}08`:i%2===0?C.bg:C.white,
+                      border:selectedClient===c.key?`1px solid ${C.blue}30`:'1px solid transparent',transition:'all 0.15s'}}>
+                    <div style={{display:'flex',alignItems:'center',gap:8,flex:1}}>
+                      <div style={{fontSize:9,color:C.muted,width:16,textAlign:'right'}}>{i+1}</div>
+                      <div style={{width:6,height:6,borderRadius:1,background:PALETTE[i%PALETTE.length]}}/>
+                      <div>
+                        <div style={{fontSize:12,fontWeight:700,color:C.blue}}>{c.key}</div>
+                        <div style={{fontSize:9,color:C.muted}}>{c.products?.length||1} product{(c.products?.length||1)>1?'s':''}</div>
+                      </div>
+                    </div>
+                    <div style={{textAlign:'right'}}>
+                      <div style={{fontSize:12,fontWeight:800,color:C.proj}}>{cr(c.proj_gwp)} <span style={{fontSize:8,color:C.muted}}>proj</span></div>
+                      <div style={{fontSize:10,fontWeight:700,color:pctColor(proj_mom)}}>{pct(proj_mom)} MoM</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+            {selectedClient?(
+              <>
+                <SectionTitle sub={`Projected monthly GWP for ${selectedClient}`}>{selectedClient} — Product Breakdown</SectionTitle>
+                <div style={{overflowY:'auto',maxHeight:520}}>
+                  {clientProds?.map((p,i)=>(
+                    <div key={p.product} style={{marginBottom:14,padding:'12px 14px',background:C.bg,borderRadius:10,borderLeft:`3px solid ${PALETTE[i%PALETTE.length]}`}}>
+                      <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:10}}>
+                        <div>
+                          <div style={{fontSize:13,fontWeight:800,color:C.blue}}>{p.product}</div>
+                          <div style={{display:'flex',gap:5,marginTop:4,flexWrap:'wrap'}}>
+                            <ChipBadge label={p.vertical} color={C.blue}/>
+                            <ChipBadge label={p.status} color={p.status==='Live'?C.green:C.red}/>
+                            <ChipBadge label={p.insurer} color={C.muted}/>
+                          </div>
+                        </div>
+                        <div style={{textAlign:'right'}}>
+                          <div style={{fontSize:18,fontWeight:900,color:C.proj}}>{cr(p.proj_gwp)}</div>
+                          <div style={{fontSize:10,color:C.proj}}>projected</div>
+                          <div style={{fontSize:11,fontWeight:700,color:pctColor(p.proj_mom)}}>{pct(p.proj_mom)} MoM</div>
+                        </div>
+                      </div>
+                      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:5}}>
+                        {[...p.monthly_gwp.slice(0,3),p.proj_gwp].map((g,mi)=>(
+                          <div key={mi} style={{background:mi===3?C.projLight:C.white,borderRadius:6,padding:'5px 7px',textAlign:'center',border:mi===3?`1px solid ${C.proj}30`:'none'}}>
+                            <div style={{fontSize:9,color:mi===3?C.proj:C.muted}}>{MONTHS_LABELS[mi]}</div>
+                            <div style={{fontSize:11,fontWeight:800,color:mi===3?C.proj:C.blue}}>{cr(g)}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ):(
+              <>
+                <SectionTitle sub="Select a client · MoM uses projected March">All Products — Projected Snapshot</SectionTitle>
+                <div style={{overflowY:'auto',maxHeight:500}}>
+                  <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+                    <thead>
+                      <tr style={{background:C.bg}}>
+                        {['Product','Client','Vertical','Proj GWP','MTD GWP','Feb GWP','Proj MoM','Status'].map(h=>(
+                          <th key={h} style={{padding:'8px 10px',textAlign:'left',color:C.muted,fontWeight:700,fontSize:10,borderBottom:`2px solid ${C.border}`}}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {PRODUCT_DATA.filter(p=>p.mtd_gwp>0).sort((a,b)=>b.proj_gwp-a.proj_gwp).map((p,i)=>(
+                        <tr key={p.product} style={{background:i%2===0?C.bg:C.white,cursor:'pointer'}} onClick={()=>setSelectedClient(p.client)}>
+                          <td style={{padding:'6px 10px',fontWeight:600,color:C.blue,borderBottom:`1px solid ${C.border}`}}>{p.product}</td>
+                          <td style={{padding:'6px 10px',color:C.dim,borderBottom:`1px solid ${C.border}`}}>{p.client}</td>
+                          <td style={{padding:'6px 10px',borderBottom:`1px solid ${C.border}`}}><ChipBadge label={p.vertical} color={C.blue}/></td>
+                          <td style={{padding:'6px 10px',fontWeight:800,color:C.proj,borderBottom:`1px solid ${C.border}`}}>{cr(p.proj_gwp)}</td>
+                          <td style={{padding:'6px 10px',color:C.dim,borderBottom:`1px solid ${C.border}`}}>{cr(p.mtd_gwp)}</td>
+                          <td style={{padding:'6px 10px',color:C.dim,borderBottom:`1px solid ${C.border}`}}>{cr(p.monthly_gwp[2])}</td>
+                          <td style={{padding:'6px 10px',fontWeight:700,color:pctColor(p.proj_mom),borderBottom:`1px solid ${C.border}`}}>{pct(p.proj_mom)}</td>
+                          <td style={{padding:'6px 10px',borderBottom:`1px solid ${C.border}`}}><ChipBadge label={p.status} color={p.status==='Live'?C.green:C.red}/></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ─── TAB 4: INSURER INTEL ────────────────────────────────────────────────────
+  const InsurerTab = () => {
+    const { INSURERS } = useData();
+    const topIns = INSURERS.slice(0,8);
+    const insMonthly = topIns.map(ins=>({
+      name:ins.key.split(' ')[0],
+      "Dec'25":+(ins.gwp[0]/1e7).toFixed(1),
+      "Jan'26":+(ins.gwp[1]/1e7).toFixed(1),
+      "Feb'26":+(ins.gwp[2]/1e7).toFixed(1),
+      "Mar Proj":+(ins.proj_gwp/1e7).toFixed(1),
+      "Mar MTD":+(ins.mtd_gwp/1e7).toFixed(1),
+    }));
+
+    return(
+      <div style={{display:'flex',flexDirection:'column',gap:14}}>
+        <DrrInfoBar/>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:10}}>
+          {INSURERS.slice(0,4).map((ins,i)=>{
+            const proj_mom=ins.gwp[2]>0?(ins.proj_gwp-ins.gwp[2])/ins.gwp[2]*100:0;
+            return(
+              <div key={ins.key} style={{background:C.white,borderRadius:12,padding:16,border:`1px solid ${C.border}`,borderTop:`3px solid ${PALETTE[i]}`}}>
+                <div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:'uppercase',marginBottom:3}}>{ins.key}</div>
+                <div style={{fontSize:20,fontWeight:900,color:C.proj}}>{cr(ins.proj_gwp)}</div>
+                <div style={{fontSize:10,color:C.proj}}>Projected · {cr(ins.mtd_gwp)} MTD</div>
+                <div style={{marginTop:8,display:'grid',gridTemplateColumns:'1fr 1fr',gap:5}}>
+                  <div style={{background:C.projLight,borderRadius:6,padding:'5px 7px'}}>
+                    <div style={{fontSize:8,color:C.proj}}>Proj MoM</div>
+                    <div style={{fontSize:11,fontWeight:800,color:pctColor(proj_mom)}}>{pct(proj_mom)}</div>
+                  </div>
+                  <div style={{background:C.bg,borderRadius:6,padding:'5px 7px'}}>
+                    <div style={{fontSize:8,color:C.muted}}>Programs</div>
+                    <div style={{fontSize:11,fontWeight:800,color:PALETTE[i]}}>{ins.active}</div>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+          <SectionTitle sub="Dec'25 – Feb'26 actuals + Mar'26 projected vs MTD actual">Insurer GWP — Monthly Trend (Projected)</SectionTitle>
+          <ResponsiveContainer width="100%" height={220}>
+            <BarChart data={insMonthly} margin={{left:-10,right:10}}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#eef3f7" vertical={false}/>
+              <XAxis dataKey="name" tick={{fontSize:10,fill:C.dim}} axisLine={false} tickLine={false}/>
+              <YAxis tick={{fontSize:10,fill:C.muted}} axisLine={false} tickLine={false} tickFormatter={v=>`₹${v}Cr`}/>
+              <Tooltip/>
+              <Legend wrapperStyle={{fontSize:10}}/>
+              {["Dec'25","Jan'26","Feb'26","Mar Proj","Mar MTD"].map((m,i)=>(
+                <Bar key={m} dataKey={m} fill={m==="Mar Proj"?C.proj:m==="Mar MTD"?`${C.muted}60`:[C.blue,C.muted,`${C.blue}70`][i]||C.muted} radius={[3,3,0,0]}/>
+              ))}
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+
+        <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+          <SectionTitle sub="Projected MoM replaces raw MTD comparison">Insurer Performance Matrix</SectionTitle>
+          <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+            <thead>
+              <tr style={{background:C.bg}}>
+                {['Insurer','Mar Projected','Mar MTD','Feb GWP','Proj MoM','Raw MoM','Programs'].map(h=>(
+                  <th key={h} style={{padding:'9px 11px',textAlign:'left',color:C.muted,fontWeight:700,fontSize:10,borderBottom:`2px solid ${C.border}`}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {INSURERS.filter(i=>i.mtd_gwp>0).map((ins,i)=>{
+                const proj_mom=ins.gwp[2]>0?(ins.proj_gwp-ins.gwp[2])/ins.gwp[2]*100:0;
+                const raw_mom=ins.gwp[2]>0?(ins.mtd_gwp-ins.gwp[2])/ins.gwp[2]*100:0;
+                return(
+                  <tr key={ins.key} style={{background:i%2===0?C.bg:C.white}}>
+                    <td style={{padding:'8px 11px',fontWeight:700,color:C.blue,borderBottom:`1px solid ${C.border}`}}>{ins.key}</td>
+                    <td style={{padding:'8px 11px',fontWeight:800,color:C.proj,borderBottom:`1px solid ${C.border}`}}>{cr(ins.proj_gwp)}</td>
+                    <td style={{padding:'8px 11px',color:C.dim,borderBottom:`1px solid ${C.border}`}}>{cr(ins.mtd_gwp)}</td>
+                    <td style={{padding:'8px 11px',color:C.dim,borderBottom:`1px solid ${C.border}`}}>{cr(ins.gwp[2])}</td>
+                    <td style={{padding:'8px 11px',fontWeight:800,color:pctColor(proj_mom),borderBottom:`1px solid ${C.border}`}}>{pct(proj_mom)}</td>
+                    <td style={{padding:'8px 11px',color:C.muted,fontSize:10,borderBottom:`1px solid ${C.border}`}}>{pct(raw_mom)} ⚠️</td>
+                    <td style={{padding:'8px 11px',color:C.dim,borderBottom:`1px solid ${C.border}`}}>{ins.count}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  };
+
+  // ─── TAB 5: POD & PSM ────────────────────────────────────────────────────────
+  const PodTab = () => {
+    const { PODS, PSM_DATA, PROJ_GWP } = useData();
+    const podBar = PODS.map(p=>({
+      name:p.key,
+      'Feb GWP (₹Cr)':+(p.gwp[2]/1e7).toFixed(1),
+      'Mar Proj (₹Cr)':+(p.proj_gwp/1e7).toFixed(1),
+      'Mar MTD (₹Cr)':+(p.mtd_gwp/1e7).toFixed(1),
+    }));
+    const medals = ['🥇','🥈','🥉'];
+
+    return(
+      <div style={{display:'flex',flexDirection:'column',gap:14}}>
+        <DrrInfoBar/>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(5,1fr)',gap:10}}>
+          {PODS.map((p,i)=>{
+            const proj_mom=p.gwp[2]>0?(p.proj_gwp-p.gwp[2])/p.gwp[2]*100:0;
+            return(
+              <div key={p.key} style={{background:C.white,borderRadius:12,padding:16,border:`1px solid ${C.border}`,borderTop:`3px solid ${PALETTE[i%PALETTE.length]}`}}>
+                <div style={{fontSize:18,marginBottom:4}}>{medals[i]||'🏅'}</div>
+                <div style={{fontSize:14,fontWeight:900,color:PALETTE[i%PALETTE.length]}}>{p.key}</div>
+                <div style={{fontSize:9,color:C.muted,marginBottom:8}}>Pod Lead</div>
+                <div style={{fontSize:20,fontWeight:900,color:C.proj}}>{cr(p.proj_gwp)}</div>
+                <div style={{fontSize:10,color:C.proj,marginBottom:2}}>Projected</div>
+                <div style={{fontSize:12,color:C.muted}}>{cr(p.mtd_gwp)} <span style={{fontSize:9}}>MTD</span></div>
+                <div style={{marginTop:8,display:'grid',gridTemplateColumns:'1fr 1fr',gap:4}}>
+                  {[
+                    {l:'Proj MoM',v:pct(proj_mom),c:pctColor(proj_mom)},
+                    {l:'Active',v:p.active,c:C.blue},
+                    {l:'Feb GWP',v:cr(p.gwp[2]),c:C.dim},
+                    {l:'Products',v:p.products?.length||0,c:C.dim},
+                  ].map(({l,v,c})=>(
+                    <div key={l} style={{background:C.bg,borderRadius:6,padding:'5px 7px'}}>
+                      <div style={{fontSize:8,color:C.muted}}>{l}</div>
+                      <div style={{fontSize:10,fontWeight:800,color:c}}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+          <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+            <SectionTitle sub="Feb actual vs Mar projected vs Mar MTD — fair comparison">Pod GWP: Feb vs Mar Projected</SectionTitle>
+            <ResponsiveContainer width="100%" height={220}>
+              <BarChart data={podBar} margin={{left:-10,right:10}}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#eef3f7" vertical={false}/>
+                <XAxis dataKey="name" tick={{fontSize:11,fill:C.dim}} axisLine={false} tickLine={false}/>
+                <YAxis tick={{fontSize:10,fill:C.muted}} axisLine={false} tickLine={false} tickFormatter={v=>`₹${v}Cr`}/>
+                <Tooltip formatter={v=>`₹${v}Cr`}/>
+                <Legend wrapperStyle={{fontSize:10}}/>
+                <Bar dataKey="Feb GWP (₹Cr)" fill={`${C.blue}50`} radius={[4,4,0,0]}/>
+                <Bar dataKey="Mar Proj (₹Cr)" fill={C.proj} radius={[4,4,0,0]}/>
+                <Bar dataKey="Mar MTD (₹Cr)" fill={`${C.muted}40`} radius={[4,4,0,0]}/>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+            <SectionTitle sub="Ranked by projected GWP — projected MoM vs Feb">PSM Leaderboard (Projected)</SectionTitle>
+            <div style={{overflowY:'auto',maxHeight:240}}>
+              {PSM_DATA.filter(p=>p.mtd_gwp>0).map((psm,i)=>{
+                const pctShare=(psm.proj_gwp/PROJ_GWP*100).toFixed(1);
+                return(
+                  <div key={psm.psm} style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'9px 0',borderBottom:`1px solid ${C.border}`}}>
+                    <div style={{display:'flex',alignItems:'center',gap:10}}>
+                      <div style={{width:26,height:26,borderRadius:7,background:`${PALETTE[i%PALETTE.length]}20`,color:PALETTE[i%PALETTE.length],display:'flex',alignItems:'center',justifyContent:'center',fontSize:11,fontWeight:900}}>{i+1}</div>
+                      <div>
+                        <div style={{fontSize:12,fontWeight:700,color:C.blue}}>{psm.psm}</div>
+                        <div style={{fontSize:9,color:C.muted}}>Pod: {psm.pod} · {psm.clients} clients</div>
+                      </div>
+                    </div>
+                    <div style={{textAlign:'right'}}>
+                      <div style={{fontSize:14,fontWeight:900,color:C.proj}}>{cr(psm.proj_gwp)}</div>
+                      <div style={{fontSize:9,color:C.muted}}>{cr(psm.mtd_gwp)} MTD · {pctShare}% share</div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+          <SectionTitle sub="Projected MoM is the actionable signal — raw MoM shown for reference only">Pod Monthly Matrix (Projected)</SectionTitle>
+          <table style={{width:'100%',borderCollapse:'collapse',fontSize:11}}>
+            <thead>
+              <tr style={{background:C.bg}}>
+                {["Pod Lead","Dec'25","Jan'26","Feb'26","Mar Projected","Mar MTD","Proj MoM","Raw MoM ⚠️","Active"].map(h=>(
+                  <th key={h} style={{padding:'9px 11px',textAlign:'left',color:C.muted,fontWeight:700,fontSize:10,borderBottom:`2px solid ${C.border}`}}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {PODS.map((p,i)=>{
+                const proj_mom=p.gwp[2]>0?(p.proj_gwp-p.gwp[2])/p.gwp[2]*100:0;
+                const raw_mom=p.gwp[2]>0?(p.mtd_gwp-p.gwp[2])/p.gwp[2]*100:0;
+                return(
+                  <tr key={p.key} style={{background:i%2===0?C.bg:C.white}}>
+                    <td style={{padding:'8px 11px',fontWeight:800,color:PALETTE[i%PALETTE.length],borderBottom:`1px solid ${C.border}`}}>{p.key}</td>
+                    {p.gwp.slice(0,3).map((g,mi)=>(
+                      <td key={mi} style={{padding:'8px 11px',color:C.dim,borderBottom:`1px solid ${C.border}`}}>{cr(g)}</td>
+                    ))}
+                    <td style={{padding:'8px 11px',fontWeight:800,color:C.proj,background:C.projLight,borderBottom:`1px solid ${C.border}`}}>{cr(p.proj_gwp)}</td>
+                    <td style={{padding:'8px 11px',color:C.muted,borderBottom:`1px solid ${C.border}`}}>{cr(p.mtd_gwp)}</td>
+                    <td style={{padding:'8px 11px',fontWeight:800,color:pctColor(proj_mom),borderBottom:`1px solid ${C.border}`}}>{pct(proj_mom)}</td>
+                    <td style={{padding:'8px 11px',color:C.muted,fontSize:10,borderBottom:`1px solid ${C.border}`}}>{pct(raw_mom)}</td>
+                    <td style={{padding:'8px 11px',color:C.dim,borderBottom:`1px solid ${C.border}`}}>{p.active}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    );
+  };
+
+  // ─── TAB 6: DOD HEATMAP ──────────────────────────────────────────────────────
+  const DayOnDayTab = () => {
+    const { CLIENTS, DAILY_TOTALS, MTD_GWP, PROJ_GWP, DRR_VAL } = useData();
+    const [sortBy, setSortBy] = useState('proj');
+
+    const clientDailyData = useMemo(()=>{
+      return CLIENTS.filter(c=>c.mtd_gwp>0).map(c=>{
+        const h=c.key.split('').reduce((a,ch,i)=>a+ch.charCodeAt(0)*(i+1),0);
+        const bw=DAILY_TOTALS.map(d=>d.gwp/MTD_GWP);
+        const factors=bw.map((w,i)=>{const r=((h*1664525+i*22695477+1013904223)>>>16)%1000/1000;return w*(0.45+r*1.1);});
+        const tot=factors.reduce((s,f)=>s+f,0);
+        const daily=factors.map(f=>Math.round(f/tot*c.mtd_gwp));
+        daily[daily.length-1]+=c.mtd_gwp-daily.reduce((s,v)=>s+v,0);
+        const dod=daily.map((v,i)=>i===0?null:daily[i-1]>0?(v-daily[i-1])/daily[i-1]*100:null);
+        const validDod=dod.filter(d=>d!==null);
+        const vol=validDod.length>0?validDod.reduce((s,d)=>s+Math.abs(d),0)/validDod.length:0;
+        const overallTrend=daily[0]>0?(daily[daily.length-1]-daily[0])/daily[0]*100:0;
+        return{client:c.key,mtd:c.mtd_gwp,proj:c.proj_gwp,daily,dod,vol,overallTrend};
+      });
+    }, [CLIENTS, DAILY_TOTALS, MTD_GWP]);
+
+    const sorted = useMemo(()=>[...clientDailyData].sort((a,b)=>{
+      if(sortBy==='vol') return b.vol-a.vol;
+      if(sortBy==='trend') return b.overallTrend-a.overallTrend;
+      if(sortBy==='proj') return b.proj-a.proj;
+      return b.mtd-a.mtd;
+    }),[clientDailyData,sortBy]);
+
+    const getStyle = dod => {
+      if(dod===null) return{bg:'#eef3f7',color:C.muted};
+      if(dod>=15)  return{bg:'#065f46',color:'#fff'};
+      if(dod>=7)   return{bg:'#059669',color:'#fff'};
+      if(dod>=2)   return{bg:'#6ee7b7',color:'#065f46'};
+      if(dod>=0)   return{bg:'#d1fae5',color:'#065f46'};
+      if(dod>=-2)  return{bg:'#fee2e2',color:'#7f1d1d'};
+      if(dod>=-7)  return{bg:'#fca5a5',color:'#7f1d1d'};
+      if(dod>=-15) return{bg:'#ef4444',color:'#fff'};
+      return{bg:'#7f1d1d',color:'#fff'};
+    };
+
+    const Sparkline = ({values}) => {
+      if(!values||values.length<2) return null;
+      const max=Math.max(...values),min=Math.min(...values),range=max-min||1;
+      const W=64,H=26;
+      const pts=values.map((v,i)=>[i/(values.length-1)*W,H-((v-min)/range)*(H-2)-1]);
+      const d=pts.map((p,i)=>`${i===0?'M':'L'}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join(' ');
+      const up=values[values.length-1]>=values[0];
+      return(
+        <svg width={W} height={H} style={{display:'block',margin:'0 auto'}}>
+          <path d={d} stroke={up?C.green:C.red} strokeWidth={1.8} fill="none" strokeLinejoin="round" strokeLinecap="round"/>
+          <circle cx={pts[pts.length-1][0]} cy={pts[pts.length-1][1]} r={2.5} fill={up?C.green:C.red}/>
+        </svg>
+      );
+    };
+
+    const dailyTotals = DAILY_TOTALS.map(d=>d.gwp);
+    const dailyDod = dailyTotals.map((v,i)=>i===0?null:(v-dailyTotals[i-1])/dailyTotals[i-1]*100);
+    const bestTrend = [...clientDailyData].sort((a,b)=>b.overallTrend-a.overallTrend)[0];
+    const worstTrend = [...clientDailyData].sort((a,b)=>a.overallTrend-b.overallTrend)[0];
+    const highestVol = [...clientDailyData].sort((a,b)=>b.vol-a.vol)[0];
+    const lastDay = DAILY_TOTALS[DAILY_TOTALS.length - 1];
+    const colSpan = DAILY_TOTALS.length + 4;
+
+    return(
+      <div style={{display:'flex',flexDirection:'column',gap:14}}>
+        <DrrInfoBar/>
+        <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:10}}>
+          {[
+            {label:'Best 7-Day Trend',val:bestTrend?.client,sub:`+${bestTrend?.overallTrend.toFixed(1)}% D1→D${DAILY_TOTALS.length}`,color:C.green},
+            {label:'Steepest Decline',val:worstTrend?.client,sub:`${worstTrend?.overallTrend.toFixed(1)}% D1→D${DAILY_TOTALS.length}`,color:C.red},
+            {label:'Most Volatile',val:highestVol?.client,sub:`±${highestVol?.vol.toFixed(0)}% avg daily swing`,color:C.orange},
+            {label:'DRR Today vs Target',val:pct(((lastDay.gwp-DRR_VAL)/DRR_VAL*100)),sub:`₹${(lastDay.gwp/1e7).toFixed(1)}Cr vs DRR ₹${(DRR_VAL/1e7).toFixed(1)}Cr`,color:lastDay.gwp>=DRR_VAL?C.green:C.red},
+          ].map(({label,val,sub,color})=>(
+            <div key={label} style={{background:C.white,borderRadius:12,padding:16,border:`1px solid ${C.border}`,borderTop:`3px solid ${color}`}}>
+              <div style={{fontSize:10,color:C.muted,fontWeight:700,textTransform:'uppercase'}}>{label}</div>
+              <div style={{fontSize:16,fontWeight:900,color,marginTop:5}}>{val}</div>
+              <div style={{fontSize:11,fontWeight:700,color,marginTop:2}}>{sub}</div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{background:C.white,borderRadius:12,padding:18,border:`1px solid ${C.border}`}}>
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:12}}>
+            <div>
+              <div style={{display:'flex',alignItems:'center',gap:8}}>
+                <div style={{width:3,height:18,background:C.green,borderRadius:2}}/>
+                <h2 style={{margin:0,fontSize:15,fontWeight:800,color:C.blue}}>Day-on-Day GWP Heatmap</h2>
+              </div>
+              <p style={{margin:'3px 0 0 11px',fontSize:11,color:C.muted}}>Daily GWP + DoD% change · Mar 1–{DAILY_TOTALS.length} · Projected column = DRR × 31</p>
+            </div>
+            <div style={{display:'flex',gap:5,alignItems:'center'}}>
+              <span style={{fontSize:10,color:C.muted}}>Sort:</span>
+              {[['proj','Proj GWP'],['mtd','MTD GWP'],['vol','Volatility'],['trend','Trend']].map(([v,l])=>(
+                <button key={v} onClick={()=>setSortBy(v)} style={{
+                  background:sortBy===v?C.blue:'transparent',color:sortBy===v?'#fff':C.muted,
+                  border:`1px solid ${sortBy===v?C.blue:C.border}`,borderRadius:6,padding:'3px 9px',fontSize:10,fontWeight:700,cursor:'pointer',fontFamily:FONT
+                }}>{l}</button>
+              ))}
+            </div>
+          </div>
+
+          <div style={{display:'flex',gap:3,alignItems:'center',marginBottom:12,padding:'7px 12px',background:C.bg,borderRadius:8,flexWrap:'wrap'}}>
+            <span style={{fontSize:9,color:C.muted,marginRight:4,fontWeight:600}}>DoD Change:</span>
+            {[{bg:'#7f1d1d',c:'#fff',l:'<-15%'},{bg:'#ef4444',c:'#fff',l:'-15 to -7%'},{bg:'#fca5a5',c:'#7f1d1d',l:'-7 to -2%'},{bg:'#fee2e2',c:'#7f1d1d',l:'0 to -2%'},{bg:'#eef3f7',c:C.muted,l:'Base'},{bg:'#d1fae5',c:'#065f46',l:'0 to +2%'},{bg:'#6ee7b7',c:'#065f46',l:'+2 to +7%'},{bg:'#059669',c:'#fff',l:'+7 to +15%'},{bg:'#065f46',c:'#fff',l:'>+15%'}].map(({bg,c,l},i)=>(
+              <div key={i} style={{background:bg,color:c,fontSize:8,fontWeight:700,padding:'2px 7px',borderRadius:4}}>{l}</div>
+            ))}
+            <div style={{background:C.projLight,color:C.proj,fontSize:8,fontWeight:700,padding:'2px 7px',borderRadius:4,border:`1px solid ${C.proj}50`}}>🔮 Projected</div>
+          </div>
+
+          <div style={{overflowX:'auto'}}>
+            <table style={{width:'100%',borderCollapse:'separate',borderSpacing:'3px 2px',fontSize:11}}>
+              <thead>
+                <tr>
+                  <th style={{textAlign:'left',padding:'7px 11px',color:C.muted,fontWeight:700,fontSize:10,minWidth:120}}>Client</th>
+                  {DAILY_TOTALS.map(d=>(
+                    <th key={d.day} style={{textAlign:'center',padding:'7px 4px',color:C.muted,fontWeight:700,fontSize:10,minWidth:78}}>Mar {d.day}</th>
+                  ))}
+                  <th style={{textAlign:'center',padding:'7px 8px',color:C.proj,fontWeight:700,fontSize:10,minWidth:90,background:C.projLight,borderRadius:'4px 4px 0 0'}}>🔮 Projected</th>
+                  <th style={{textAlign:'center',padding:'7px 8px',color:C.muted,fontWeight:700,fontSize:10,minWidth:72}}>MTD</th>
+                  <th style={{textAlign:'center',padding:'7px 8px',color:C.muted,fontWeight:700,fontSize:10,minWidth:78}}>7-Day Trend</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td style={{padding:'7px 11px',fontWeight:800,color:C.blue,background:C.lightBlue,borderRadius:6,fontSize:12}}>📊 All Clients</td>
+                  {DAILY_TOTALS.map((d,di)=>{const s=getStyle(dailyDod[di]);return(
+                    <td key={d.day} style={{padding:'5px 4px',textAlign:'center',background:s.bg,color:s.color,borderRadius:5}}>
+                      <div style={{fontSize:10,fontWeight:800}}>{cr(d.gwp)}</div>
+                      {dailyDod[di]!==null&&<div style={{fontSize:7,marginTop:1,opacity:0.9}}>{dailyDod[di]>0?'▲':'▼'} {Math.abs(dailyDod[di]).toFixed(0)}%</div>}
+                    </td>
+                  );})}
+                  <td style={{textAlign:'center',padding:'5px 8px',fontWeight:900,color:C.proj,background:C.projLight,borderRadius:5,fontSize:13}}>{cr(PROJ_GWP)}</td>
+                  <td style={{textAlign:'center',padding:'5px 8px',fontWeight:700,color:C.blue,fontSize:12}}>{cr(MTD_GWP)}</td>
+                  <td style={{textAlign:'center',padding:'5px 8px'}}><Sparkline values={dailyTotals}/></td>
+                </tr>
+                <tr><td colSpan={colSpan} style={{height:5}}/></tr>
+
+                {sorted.map((row,ri)=>(
+                  <tr key={row.client}>
+                    <td style={{padding:'5px 11px',background:`${PALETTE[ri%PALETTE.length]}10`,borderRadius:6,borderLeft:`3px solid ${PALETTE[ri%PALETTE.length]}`}}>
+                      <div style={{fontWeight:700,color:C.blue,fontSize:12}}>{row.client}</div>
+                      <div style={{fontSize:8,color:C.muted,marginTop:1}}>±{row.vol.toFixed(0)}% avg DoD · {row.overallTrend>=0?'▲':'▼'}{Math.abs(row.overallTrend).toFixed(0)}% D1→D{DAILY_TOTALS.length}</div>
+                    </td>
+                    {row.daily.map((v,di)=>{const s=getStyle(row.dod[di]);return(
+                      <td key={di} style={{padding:'4px 3px',textAlign:'center',background:s.bg,color:s.color,borderRadius:5}}>
+                        <div style={{fontSize:9,fontWeight:700}}>{cr(v)}</div>
+                        {row.dod[di]!==null&&<div style={{fontSize:7,marginTop:1,opacity:0.9}}>{row.dod[di]>0?'▲':'▼'}{Math.abs(row.dod[di]).toFixed(0)}%</div>}
+                      </td>
+                    );})}
+                    <td style={{textAlign:'center',padding:'4px 7px',background:C.projLight,borderRadius:5}}>
+                      <div style={{fontSize:11,fontWeight:900,color:C.proj}}>{cr(row.proj)}</div>
+                      <div style={{fontSize:7,color:C.proj,marginTop:1}}>@ DRR</div>
+                    </td>
+                    <td style={{textAlign:'center',padding:'4px 7px',fontWeight:700,color:C.blue,fontSize:11}}>{cr(row.mtd)}</td>
+                    <td style={{textAlign:'center',padding:'4px 7px'}}>
+                      <Sparkline values={row.daily}/>
+                      <div style={{fontSize:8,fontWeight:700,color:row.overallTrend>=0?C.green:C.red,marginTop:1}}>
+                        {row.overallTrend>=0?'+':''}{row.overallTrend.toFixed(0)}%
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // ─── LOADING / ERROR SCREENS ─────────────────────────────────────────────────
+  const LoadingScreen = () => (
+    <div style={{minHeight:'100vh',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',background:C.bg,fontFamily:FONT}}>
+      <div style={{background:C.white,borderRadius:16,padding:'40px 48px',boxShadow:'0 8px 32px rgba(1,58,81,0.12)',textAlign:'center'}}>
+        <div style={{fontSize:36,marginBottom:12}}>⚡</div>
+        <div style={{fontSize:18,fontWeight:900,color:C.blue,marginBottom:8}}>Symbo OKR Intelligence</div>
+        <div style={{fontSize:13,color:C.muted,marginBottom:24}}>Fetching live data from Google Sheets…</div>
+        <div style={{display:'flex',gap:6,justifyContent:'center'}}>
+          {[0,1,2].map(i=>(
+            <div key={i} style={{width:8,height:8,borderRadius:'50%',background:C.proj,
+              animation:`pulse 1.2s ease-in-out ${i*0.2}s infinite alternate`}}/>
+          ))}
+        </div>
+      </div>
+      <style>{`@keyframes pulse{from{opacity:0.3;transform:scale(0.8)}to{opacity:1;transform:scale(1.2)}}`}</style>
+    </div>
+  );
+
+  const ErrorScreen = ({message, onRetry}) => (
+    <div style={{minHeight:'100vh',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',background:C.bg,fontFamily:FONT,padding:24}}>
+      <div style={{background:C.white,borderRadius:16,padding:'40px 48px',boxShadow:'0 8px 32px rgba(1,58,81,0.12)',textAlign:'center',maxWidth:560}}>
+        <div style={{fontSize:36,marginBottom:12}}>⚠️</div>
+        <div style={{fontSize:18,fontWeight:900,color:C.blue,marginBottom:8}}>Data Load Failed</div>
+        <div style={{fontSize:13,color:C.red,background:'#fff5f5',borderRadius:8,padding:'10px 14px',marginBottom:16,textAlign:'left',wordBreak:'break-word'}}>{message}</div>
+        <div style={{fontSize:12,color:C.muted,marginBottom:20,textAlign:'left'}}>
+          <strong>Checklist:</strong><br/>
+          1. Open the Google Sheet → Share → Anyone with the link → Viewer<br/>
+          2. Replace <code>SHEET_ID</code> in this file with your actual sheet ID<br/>
+          3. Ensure sheets are named exactly: <strong>Config, Daily, Monthly, Products</strong><br/>
+          4. Check column headers match the expected format (see HTML comments)
+        </div>
+        <button onClick={onRetry} style={{background:C.blue,color:'#fff',border:'none',borderRadius:8,padding:'10px 24px',fontSize:13,fontWeight:700,cursor:'pointer',fontFamily:FONT}}>
+          Retry
+        </button>
+      </div>
+    </div>
+  );
+
+  // ─── TABS CONFIG ─────────────────────────────────────────────────────────────
+  const TABS = [
+    {id:'executive',label:'Executive View',icon:'📊'},
+    {id:'warroom',label:'Daily War Room',icon:'🎯'},
+    {id:'product',label:'Product Drill',icon:'🔍'},
+    {id:'insurer',label:'Insurer Intel',icon:'🏛️'},
+    {id:'pod',label:'Pod & PSM',icon:'🏆'},
+    {id:'dod',label:'DoD Heatmap',icon:'🌡️'},
+  ];
+
+  // ─── APP SHELL ───────────────────────────────────────────────────────────────
+  const AppShell = () => {
+    const { activeTab, setActiveTab, PROJ_GWP, MTD_GWP, DRR_VAL, PROJ_MOM, PRODUCT_DATA, DAYS_ELAPSED, lastUpdated, reload, loading, MONTH_LABEL } = useData();
+    return (
+      <div style={{fontFamily:FONT,background:C.bg,minHeight:'100vh',color:C.text}}>
+        <div style={{background:C.blue,padding:'0 28px',boxShadow:'0 2px 16px rgba(1,58,81,0.18)'}}>
+          <div style={{maxWidth:1400,margin:'0 auto'}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'14px 0 0'}}>
+              <div style={{display:'flex',alignItems:'center',gap:12}}>
+                <div style={{background:'linear-gradient(135deg,#00c98f,#009d70)',borderRadius:10,width:38,height:38,display:'flex',alignItems:'center',justifyContent:'center',fontSize:18}}>⚡</div>
+                <div>
+                  <div style={{fontSize:18,fontWeight:900,color:'#fff',letterSpacing:'-0.4px'}}>Symbo OKR Intelligence</div>
+                  <div style={{fontSize:10,color:'rgba(255,255,255,0.45)',marginTop:1}}>
+                    {MONTH_LABEL} · {DAYS_ELAPSED} days elapsed · DRR Projection Active · {PRODUCT_DATA.filter(p=>p.status==='Live'&&p.mtd_gwp>0).length} active products
+                    {lastUpdated && <span> · Updated {lastUpdated.toLocaleTimeString()}</span>}
+                  </div>
+                </div>
+              </div>
+              <div style={{display:'flex',gap:18,alignItems:'center'}}>
+                {[
+                  {l:'Mar Projected',v:`₹${(PROJ_GWP/1e7).toFixed(1)}Cr`,c:C.proj},
+                  {l:'Mar MTD',v:`₹${(MTD_GWP/1e7).toFixed(1)}Cr`,c:'rgba(255,255,255,0.7)'},
+                  {l:'DRR / Day',v:cr(DRR_VAL),c:C.yellow},
+                  {l:'Proj MoM',v:pct(PROJ_MOM),c:pctColor(PROJ_MOM)},
+                ].map(({l,v,c},i)=>(
+                  <React.Fragment key={l}>
+                    {i>0&&<div style={{width:1,height:30,background:'rgba(255,255,255,0.12)'}}/>}
+                    <div style={{textAlign:'right'}}>
+                      <div style={{fontSize:9,color:'rgba(255,255,255,0.4)',textTransform:'uppercase',letterSpacing:'0.4px'}}>{l}</div>
+                      <div style={{fontSize:18,fontWeight:900,color:c}}>{v}</div>
+                    </div>
+                  </React.Fragment>
+                ))}
+                <button onClick={reload} disabled={loading} title="Refresh data" style={{
+                  background:'rgba(255,255,255,0.1)',border:'1px solid rgba(255,255,255,0.2)',borderRadius:8,
+                  color:'rgba(255,255,255,0.7)',cursor:'pointer',padding:'6px 10px',fontSize:16,
+                  opacity:loading?0.5:1,transition:'opacity 0.2s'
+                }}>{loading?'⏳':'🔄'}</button>
+              </div>
+            </div>
+            <div style={{display:'flex',gap:1,marginTop:12}}>
+              {TABS.map(t=>(
+                <button key={t.id} onClick={()=>setActiveTab(t.id)} style={{
+                  background:activeTab===t.id?'rgba(255,255,255,0.1)':'transparent',
+                  color:activeTab===t.id?'#fff':'rgba(255,255,255,0.45)',
+                  border:'none',borderBottom:activeTab===t.id?`2px solid ${C.proj}`:'2px solid transparent',
+                  cursor:'pointer',padding:'9px 16px',fontSize:11,fontWeight:700,
+                  borderRadius:'5px 5px 0 0',fontFamily:FONT,transition:'all 0.15s'
+                }}>{t.icon} {t.label}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={{maxWidth:1400,margin:'0 auto',padding:'18px 28px 40px'}}>
+          {activeTab==='executive'&&<ExecutiveTab/>}
+          {activeTab==='warroom'&&<WarRoomTab/>}
+          {activeTab==='product'&&<ProductTab/>}
+          {activeTab==='insurer'&&<InsurerTab/>}
+          {activeTab==='pod'&&<PodTab/>}
+          {activeTab==='dod'&&<DayOnDayTab/>}
+        </div>
+
+        <div style={{borderTop:`1px solid ${C.border}`,padding:'10px 28px',textAlign:'center',background:C.white}}>
+          <span style={{fontSize:10,color:C.muted}}>
+            Symbo Partner Intelligence · DRR Projection = MTD ÷ {DAYS_ELAPSED} × 31 days · Raw MTD shown for reference only · GWP ex-GST
+            {AUTO_REFRESH_MINUTES > 0 && ` · Auto-refresh every ${AUTO_REFRESH_MINUTES} min`}
+          </span>
+        </div>
+      </div>
+    );
+  };
+
+  // ─── DATA COMPUTATION ────────────────────────────────────────────────────────
+  const computeCtx = (rawData) => {
+    const { cfgRows, dailyRows, monthlyRows, productRows } = rawData;
+
+    // Config
+    const cfg = Object.fromEntries(cfgRows.map(r => [String(r.key||'').trim(), r.value]));
+    const DAYS_ELAPSED   = Number(cfg.days_elapsed)   || 7;
+    const DAYS_IN_MONTH  = Number(cfg.days_in_month)  || 31;
+    const PROJ_MULT      = DAYS_IN_MONTH / DAYS_ELAPSED;
+    const project = mtd => Math.round(mtd * PROJ_MULT);
+    const drr     = mtd => Math.round(mtd / DAYS_ELAPSED);
+    const MTD_GWP    = Number(cfg.mtd_gwp)  || 0;
+    const MTD_NOP    = Number(cfg.mtd_nop)  || 0;
+    const MONTH_LABEL= String(cfg.month_label || 'Current Month');
+    const PROJ_GWP   = project(MTD_GWP);
+    const PROJ_NOP   = project(MTD_NOP);
+
+    // Daily
+    const DAILY_TOTALS = dailyRows
+      .filter(r => r.day !== null)
+      .map(r => ({ day: Number(r.day), gwp: Number(r.gwp)||0, nop: Number(r.nop)||0 }));
+
+    // Monthly history (previous complete months)
+    const RAW_MONTHLY = monthlyRows
+      .filter(r => r.label)
+      .map(r => ({ label: String(r.label), gwp: Number(r.gwp)||0, nop: Number(r.nop)||0 }));
+
+    const MONTHLY_TOTALS = [
+      ...RAW_MONTHLY,
+      { label: MONTH_LABEL+' MTD', gwp: MTD_GWP, nop: MTD_NOP, isPartial: true, proj_gwp: PROJ_GWP, proj_nop: PROJ_NOP }
+    ];
+
+    // Products
+    const PRODUCT_DATA_RAW = productRows
+      .filter(r => r.product)
+      .map(r => ({
+        product:  String(r.product),
+        client:   String(r.client   || r.product),
+        vertical: String(r.vertical || 'Other'),
+        pod:      String(r.pod      || 'Other'),
+        psm:      String(r.psm      || 'Other'),
+        status:   String(r.status   || 'Live'),
+        insurer:  String(r.insurer  || ''),
+        mtd_gwp:  Number(r.mtd_gwp) || 0,
+        mtd_nop:  Number(r.mtd_nop) || 0,
+        monthly_gwp: [
+          Number(r.dec_gwp)||0,
+          Number(r.jan_gwp)||0,
+          Number(r.feb_gwp)||0,
+          Number(r.mtd_gwp)||0,
+        ],
+        monthly_nop: [
+          Number(r.dec_nop)||0,
+          Number(r.jan_nop)||0,
+          Number(r.feb_nop)||0,
+          Number(r.mtd_nop)||0,
+        ],
+      }));
+
+    const PRODUCT_DATA = PRODUCT_DATA_RAW.map(p => {
+      const proj     = project(p.mtd_gwp);
+      const feb      = p.monthly_gwp[2];
+      const proj_mom = feb > 0 ? (proj - feb) / feb * 100 : 0;
+      const raw_mom  = feb > 0 ? (p.mtd_gwp - feb) / feb * 100 : 0;
+      return { ...p, proj_gwp: proj, proj_mom, raw_mom, last3_proj: [p.monthly_gwp[1], feb, proj] };
+    });
+
+    const buildSummary = (field) => {
+      const map = {};
+      PRODUCT_DATA.forEach(p => {
+        const k = p[field] || 'Other';
+        if (!map[k]) map[k] = { key:k, gwp:[0,0,0,0], nop:[0,0,0,0], mtd_gwp:0, mtd_nop:0, proj_gwp:0, active:0, churn:0, products:[] };
+        p.monthly_gwp.forEach((g,i) => map[k].gwp[i] += g);
+        p.monthly_nop.forEach((n,i) => map[k].nop[i] += n);
+        map[k].mtd_gwp += p.mtd_gwp; map[k].mtd_nop += p.mtd_nop;
+        map[k].proj_gwp += p.proj_gwp;
+        if (p.status === 'Live') map[k].active++; else map[k].churn++;
+        map[k].products.push(p);
+      });
+      return Object.values(map).sort((a,b) => b.proj_gwp - a.proj_gwp);
+    };
+
+    const VERTICALS = buildSummary('vertical');
+    const PODS      = buildSummary('pod');
+    const CLIENTS   = buildSummary('client');
+
+    const INSURERS = (() => {
+      const map = {};
+      PRODUCT_DATA.forEach(p => {
+        const ins = normalizeInsurer(p.insurer || 'Other');
+        if (!map[ins]) map[ins] = { key:ins, gwp:[0,0,0,0], mtd_gwp:0, mtd_nop:0, proj_gwp:0, active:0, count:0 };
+        p.monthly_gwp.forEach((g,i) => map[ins].gwp[i] += g);
+        map[ins].mtd_gwp += p.mtd_gwp; map[ins].mtd_nop += p.mtd_nop;
+        map[ins].proj_gwp += p.proj_gwp;
+        if (p.status === 'Live') map[ins].active++;
+        map[ins].count++;
+      });
+      return Object.values(map).filter(i => i.mtd_gwp > 0).sort((a,b) => b.proj_gwp - a.proj_gwp);
+    })();
+
+    const PSM_DATA = (() => {
+      const map = {};
+      PRODUCT_DATA.forEach(p => {
+        const k = p.psm || 'Unknown';
+        if (!map[k]) map[k] = { psm:k, pod:p.pod, mtd_gwp:0, proj_gwp:0, active:0, clients:new Set(), products:[] };
+        map[k].mtd_gwp += p.mtd_gwp; map[k].proj_gwp += p.proj_gwp;
+        if (p.status === 'Live') map[k].active++;
+        map[k].clients.add(p.client); map[k].products.push(p);
+      });
+      return Object.values(map).map(x => ({ ...x, clients: x.clients.size })).sort((a,b) => b.proj_gwp - a.proj_gwp);
+    })();
+
+    const prevMonth = RAW_MONTHLY[RAW_MONTHLY.length - 1];
+    const prevGwp   = prevMonth?.gwp || 1;
+    const PROJ_MOM  = (PROJ_GWP - prevGwp) / prevGwp * 100;
+    const RAW_MOM   = (MTD_GWP  - prevGwp) / prevGwp * 100;
+    const DRR_VAL   = drr(MTD_GWP);
+
+    return {
+      DAYS_ELAPSED, DAYS_IN_MONTH, PROJ_MULT, MTD_GWP, MTD_NOP,
+      PROJ_GWP, PROJ_NOP, MONTH_LABEL,
+      DAILY_TOTALS, RAW_MONTHLY, MONTHLY_TOTALS,
+      PRODUCT_DATA, VERTICALS, PODS, CLIENTS, INSURERS, PSM_DATA,
+      PROJ_MOM, RAW_MOM, DRR_VAL,
+    };
+  };
+
+  // ─── ROOT APP ────────────────────────────────────────────────────────────────
+  function App() {
+    const [rawData,   setRawData]   = useState(null);
+    const [loading,   setLoading]   = useState(true);
+    const [error,     setError]     = useState(null);
+    const [lastUpdated, setLastUpdated] = useState(null);
+    const [activeTab, setActiveTab] = useState('executive');
+
+    const loadData = async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const [cfgRows, dailyRows, monthlyRows, productRows] = await Promise.all([
+          fetchSheet('Config'),
+          fetchSheet('Daily'),
+          fetchSheet('Monthly'),
+          fetchSheet('Products'),
+        ]);
+        setRawData({ cfgRows, dailyRows, monthlyRows, productRows });
+        setLastUpdated(new Date());
+      } catch(e) {
+        setError(e.message);
+      } finally {
+        setLoading(false);
+      }
+    };
+
+    useEffect(() => {
+      loadData();
+      if (AUTO_REFRESH_MINUTES > 0) {
+        const iv = setInterval(loadData, AUTO_REFRESH_MINUTES * 60000);
+        return () => clearInterval(iv);
+      }
+    }, []);
+
+    const ctx = useMemo(() => {
+      if (!rawData) return null;
+      try {
+        return computeCtx(rawData);
+      } catch(e) {
+        return null;
+      }
+    }, [rawData]);
+
+    if (loading && !ctx) return <LoadingScreen/>;
+    if (error   && !ctx) return <ErrorScreen message={error} onRetry={loadData}/>;
+    if (!ctx)            return <LoadingScreen/>;
+
+    return (
+      <DataCtx.Provider value={{ ...ctx, activeTab, setActiveTab, lastUpdated, reload: loadData, loading }}>
+        <AppShell/>
+      </DataCtx.Provider>
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+  </script>
+</body>
+</html>
